@@ -1,0 +1,186 @@
+name: build
+
+# Every push and pull request builds and packages all targets (as workflow artifacts).
+# Pushing a version tag (e.g. v1.2.3) additionally publishes a GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read version from Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  linux:
+    needs: version
+    # Oldest supported runner, so the binary also runs on distributions with an older glibc.
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Binary archive
+        run: |
+          mkdir -p dist stopwatch-$VERSION-linux-x86_64
+          cp target/release/stopwatch LICENSE README.md stopwatch-$VERSION-linux-x86_64/
+          tar czf dist/stopwatch-$VERSION-linux-x86_64.tar.gz stopwatch-$VERSION-linux-x86_64
+
+      - name: Debian package
+        run: cargo deb --no-build --output dist/
+
+      - name: AppImage
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/stopwatch AppDir/usr/bin/
+          cp packaging/linux/stopwatch.desktop AppDir/
+          cp packaging/linux/stopwatch.desktop AppDir/usr/share/applications/
+          cp assets/icon.png AppDir/stopwatch.png
+          cp assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/stopwatch.png
+          ln -s usr/bin/stopwatch AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir dist/Stopwatch-$VERSION-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+      # Input for the Arch package job.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: target/release/stopwatch
+
+  arch:
+    needs: [version, linux]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: pkg
+      - name: Build package
+        run: |
+          cp packaging/linux/stopwatch.desktop LICENSE pkg/
+          cp assets/icon.png pkg/stopwatch.png
+          sed "s/^pkgver=.*/pkgver=$VERSION/" packaging/arch/PKGBUILD > pkg/PKGBUILD
+          # makepkg refuses to run as root.
+          useradd -m builder
+          chown -R builder pkg
+          su builder -c "cd pkg && makepkg --nodeps --noconfirm"
+          mkdir -p dist
+          cp pkg/*.pkg.tar.zst dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Static C runtime: no Visual C++ redistributable needed.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/stopwatch.exe dist/stopwatch-$VERSION-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Build universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist stopwatch-$VERSION-macos-universal
+          lipo -create -output stopwatch-$VERSION-macos-universal/stopwatch \
+            target/aarch64-apple-darwin/release/stopwatch \
+            target/x86_64-apple-darwin/release/stopwatch
+          cp LICENSE README.md stopwatch-$VERSION-macos-universal/
+          tar czf dist/stopwatch-$VERSION-macos-universal.tar.gz stopwatch-$VERSION-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, arch, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          # The raw binary is only the input of the Arch job; it ships inside the tar.gz.
+          rm -f dist/stopwatch
+          cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

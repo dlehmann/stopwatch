@@ -1,0 +1,20 @@
+# Maintainer: Dennis Lehmann <mail@dennis-lehmann.de>
+# Packages the prebuilt Linux release binary. The release workflow sets pkgver.
+pkgname=stopwatch
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Always-on-top stopwatch with global hotkeys"
+arch=('x86_64')
+url="https://github.com/dlehmann/stopwatch"
+license=('MIT')
+# Loaded at runtime via dlopen (X11 and OpenGL).
+depends=('glibc' 'gcc-libs' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon-x11' 'libglvnd')
+source=("stopwatch" "stopwatch.desktop" "stopwatch.png" "LICENSE")
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 stopwatch "$pkgdir/usr/bin/stopwatch"
+    install -Dm644 stopwatch.desktop "$pkgdir/usr/share/applications/stopwatch.desktop"
+    install -Dm644 stopwatch.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/stopwatch.png"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

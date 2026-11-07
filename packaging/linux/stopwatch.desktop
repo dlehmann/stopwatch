@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Stopwatch
+Name[de]=Stoppuhr
+GenericName=Stopwatch
+GenericName[de]=Stoppuhr
+Comment=Always-on-top stopwatch with global hotkeys
+Comment[de]=Stoppuhr im Vordergrund mit globalen Tastenkürzeln
+Exec=stopwatch
+Icon=stopwatch
+Terminal=false
+Categories=Utility;Clock;
+Keywords=timer;stopwatch;clock;
+StartupWMClass=stopwatch
