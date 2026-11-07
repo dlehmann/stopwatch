@@ -24,7 +24,6 @@ const NO_AUTOLOADING: u32 = 4;
 
 pub struct KdeBackend {
     proxy: Proxy<'static>,
-    active: Vec<(Action, Vec<i32>)>,
 }
 
 fn action_id(action: Action) -> Vec<&'static str> {
@@ -35,6 +34,22 @@ fn action_id(action: Action) -> Vec<&'static str> {
         Action::Reset => "Reset",
     };
     vec![COMPONENT, action.id(), COMPONENT_FRIENDLY, friendly]
+}
+
+/// Deactivates our shortcuts so KDE releases the keys while we are not running.
+/// They stay registered (and visible in the system settings) until the next start.
+fn set_inactive(proxy: &Proxy<'_>) {
+    for action in Action::ALL {
+        let _ = proxy.call_method("setInactive", &(action_id(action),));
+    }
+}
+
+/// Releases the keys over a fresh D-Bus connection, for exit paths without the backend.
+pub fn release_all() {
+    let Ok(conn) = Connection::session() else { return };
+    if let Ok(proxy) = Proxy::new(&conn, SERVICE, "/kglobalaccel", "org.kde.KGlobalAccel") {
+        set_inactive(&proxy);
+    }
 }
 
 impl KdeBackend {
@@ -68,10 +83,7 @@ impl KdeBackend {
                 }
             })?;
 
-        Ok(Self {
-            proxy,
-            active: Vec::new(),
-        })
+        Ok(Self { proxy })
     }
 
     fn set_shortcut(&self, action: Action, keys: &[i32], flags: u32) -> zbus::Result<Vec<i32>> {
@@ -85,7 +97,6 @@ impl Backend for KdeBackend {
     }
 
     fn apply(&mut self, bindings: &[(Action, KeyCombo)]) -> Vec<Action> {
-        self.active.clear();
         let mut failed = Vec::new();
         for action in Action::ALL {
             let combo = bindings.iter().find(|(a, _)| *a == action).map(|(_, c)| *c);
@@ -97,11 +108,7 @@ impl Backend for KdeBackend {
             match self.set_shortcut(action, &keys, SET_PRESENT | NO_AUTOLOADING) {
                 // KGlobalAccel returns the keys it actually assigned; an empty result
                 // means the key is already taken by another component.
-                Ok(assigned) if assigned == keys => {
-                    if !keys.is_empty() {
-                        self.active.push((action, keys));
-                    }
-                }
+                Ok(assigned) if assigned == keys => {}
                 _ if keys.is_empty() => {}
                 _ => failed.push(action),
             }
@@ -110,9 +117,6 @@ impl Backend for KdeBackend {
     }
 
     fn shutdown(&mut self) {
-        // Mark the shortcuts as "not present" so KDE releases the keys while we are not running.
-        for (action, keys) in std::mem::take(&mut self.active) {
-            let _ = self.set_shortcut(action, &keys, NO_AUTOLOADING);
-        }
+        set_inactive(&self.proxy);
     }
 }

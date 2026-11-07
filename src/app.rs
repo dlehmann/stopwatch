@@ -94,6 +94,7 @@ impl StopwatchApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         let ctx = &cc.egui_ctx;
         install_fonts(ctx);
+        hotkeys::close_on_signal(ctx);
         let mut app = Self {
             config,
             stopwatch: Stopwatch::default(),

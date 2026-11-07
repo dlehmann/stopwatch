@@ -80,6 +80,36 @@ impl Hotkeys {
     }
 }
 
+/// Closes the app cleanly on SIGTERM/SIGINT/SIGHUP (e.g. `kill`, Ctrl+C, logout), so that
+/// `Hotkeys::shutdown` runs. Grabs of the other backends end with the process anyway,
+/// but KDE keeps the keys reserved until they are explicitly deactivated.
+pub fn close_on_signal(ctx: &egui::Context) {
+    #[cfg(unix)]
+    {
+        use signal_hook::{
+            consts::{SIGHUP, SIGINT, SIGTERM},
+            iterator::Signals,
+        };
+        let Ok(mut signals) = Signals::new([SIGTERM, SIGINT, SIGHUP]) else {
+            return;
+        };
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
+            if signals.forever().next().is_some() {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                ctx.request_repaint();
+                // Fallback in case the UI does not process the close request (e.g. while hidden).
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                #[cfg(target_os = "linux")]
+                kde::release_all();
+                std::process::exit(0);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = ctx;
+}
+
 /// Backend based on the `global-hotkey` crate.
 struct GenericBackend {
     manager: GlobalHotKeyManager,
