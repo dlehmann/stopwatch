@@ -1,8 +1,9 @@
-//! Locks the aspect ratio of the timer window with the native window system,
-//! so the window manager keeps the ratio while the user drags a window edge.
-//! winit has no API for this.
+//! Locks the aspect ratio of the timer window with the native window system
+//! (Windows, macOS), so the ratio is kept while the user drags a window edge.
+//! winit has no API for this. On Linux the app snaps the size after resizing instead,
+//! because KWin ignores X11 aspect hints for XWayland windows.
 
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::HasWindowHandle;
 
 /// Returns true once the aspect ratio has been applied.
 pub fn lock(window: &impl HasWindowHandle, width: u32, height: u32) -> bool {
@@ -10,39 +11,18 @@ pub fn lock(window: &impl HasWindowHandle, width: u32, height: u32) -> bool {
         return false;
     };
     match handle.as_raw() {
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Xlib(h) => x11::lock(h.window as u32, width, height).is_ok(),
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Xcb(h) => x11::lock(h.window.get(), width, height).is_ok(),
         #[cfg(windows)]
-        RawWindowHandle::Win32(h) => win32::lock(h.hwnd.get() as _, width as f32 / height as f32),
+        raw_window_handle::RawWindowHandle::Win32(h) => {
+            win32::lock(h.hwnd.get() as _, width as f32 / height as f32)
+        }
         #[cfg(target_os = "macos")]
-        RawWindowHandle::AppKit(h) => unsafe { appkit::lock(h.ns_view.as_ptr(), width, height) },
+        raw_window_handle::RawWindowHandle::AppKit(h) => unsafe {
+            appkit::lock(h.ns_view.as_ptr(), width, height)
+        },
         _ => {
             let _ = (width, height);
             false
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod x11 {
-    use x11rb::{
-        connection::Connection,
-        properties::{AspectRatio, WmSizeHints},
-    };
-
-    /// Sets min/max aspect in WM_NORMAL_HINTS, keeping the hints winit already set.
-    pub fn lock(window: u32, width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
-        let (conn, _) = x11rb::connect(None)?;
-        let mut hints = WmSizeHints::get_normal_hints(&conn, window)?
-            .reply()?
-            .unwrap_or_default();
-        let ratio = AspectRatio::new(width as i32, height as i32);
-        hints.aspect = Some((ratio, ratio));
-        hints.set_normal_hints(&conn, window)?;
-        conn.flush()?;
-        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
 //! The egui application: timer window and settings window.
 
 use eframe::egui;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{
     Align, Color32, Layout, RichText, ThemePreference, ViewportBuilder, ViewportCommand, ViewportId,
@@ -34,7 +34,8 @@ pub struct StopwatchApp {
     /// Frames shown since the timer / settings window was created (see `keep_on_top`).
     root_frames: u32,
     settings_frames: u32,
-    aspect_frames: u32,
+    native_aspect_tried: bool,
+    aspect: AspectState,
     history: History,
     history_open: bool,
     history_frames: u32,
@@ -64,6 +65,99 @@ fn install_fonts(ctx: &egui::Context) {
         vec![CLOCK_FONT.to_owned()],
     );
     ctx.set_fonts(fonts);
+}
+
+/// Tracks window resizes for `StopwatchApp::enforce_aspect_ratio`.
+struct AspectState {
+    last_size: egui::Vec2,
+    changed_at: Instant,
+    /// Last size with the correct aspect ratio.
+    reference: egui::Vec2,
+    /// A size correction that was requested but not applied yet.
+    pending: Option<(egui::Vec2, Instant)>,
+}
+
+impl Default for AspectState {
+    fn default() -> Self {
+        Self {
+            last_size: egui::Vec2::ZERO,
+            changed_at: Instant::now(),
+            reference: egui::Vec2::ZERO,
+            pending: None,
+        }
+    }
+}
+
+/// A fixed-size dialog window, see `StopwatchApp::dialog`.
+struct Dialog {
+    id: &'static str,
+    title: T,
+    size: egui::Vec2,
+    /// Frame counter of this window (for `keep_on_top`).
+    frames: fn(&mut StopwatchApp) -> &mut u32,
+    body: fn(&mut StopwatchApp, &mut egui::Ui),
+    /// Content of the bottom bar; returns true to close the window.
+    footer: fn(&mut StopwatchApp, &mut egui::Ui) -> bool,
+}
+
+/// Outer margin of the dialog windows.
+const DIALOG_MARGIN: f32 = 16.0;
+
+/// A rounded, full-width box with a title, used to group settings.
+fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(8.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(15.0));
+            ui.add_space(2.0);
+            add_contents(ui);
+        });
+}
+
+/// A labelled drop-down that fills the rest of the row. Returns true if the value changed.
+fn select_row<V: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    label_width: f32,
+    value: &mut V,
+    options: &[(V, &str)],
+) -> bool {
+    let before = *value;
+    ui.horizontal(|ui| {
+        cell(ui, label_width, 28.0, |ui| ui.label(label));
+        let selected = options
+            .iter()
+            .find(|(v, _)| v == value)
+            .map_or("", |(_, text)| *text);
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(selected)
+            .width(ui.available_width())
+            .height(200.0)
+            .show_ui(ui, |ui| {
+                for (option, text) in options {
+                    ui.selectable_value(value, *option, *text);
+                }
+            });
+    });
+    *value != before
+}
+
+/// Allocates a fixed-size, left-aligned, vertically centered cell.
+fn cell<R>(ui: &mut egui::Ui, width: f32, height: f32, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, height));
+            add_contents(ui)
+        },
+    )
+    .inner
 }
 
 /// Scales fonts and spacing so the whole timer window grows and shrinks with it.
@@ -108,7 +202,8 @@ impl StopwatchApp {
             applied_lang: None,
             root_frames: 0,
             settings_frames: 0,
-            aspect_frames: 0,
+            native_aspect_tried: false,
+            aspect: AspectState::default(),
             history: History::load(),
             history_open: false,
             history_frames: 0,
@@ -217,29 +312,58 @@ impl StopwatchApp {
 
     /// Locks the window's aspect ratio once it is visible, and fixes a size restored
     /// from a previous run that does not match the ratio.
-    fn lock_aspect_ratio(&mut self, ui: &egui::Ui, frame: &eframe::Frame) {
-        // Runs during the first frames only (keep_on_top() keeps repainting then).
-        // winit rewrites WM_NORMAL_HINTS while the window is being mapped and resized,
-        // so on X11 the hint is applied a few times after the size correction.
-        const LOCK_FRAMES: [u32; 3] = [4, 7, 10];
-        if self.aspect_frames > 10 {
+    /// Keeps the timer window at the aspect ratio of `BASE_SIZE`.
+    ///
+    /// On Windows and macOS the window system enforces it while dragging (see `aspect`).
+    /// Elsewhere (KWin does not apply aspect hints to XWayland windows) the window is
+    /// snapped to the ratio as soon as the user stops resizing it.
+    fn enforce_aspect_ratio(&mut self, ui: &egui::Ui, frame: &eframe::Frame) {
+        const SETTLE: Duration = Duration::from_millis(250);
+        let ctx = ui.ctx();
+
+        if !self.native_aspect_tried && self.root_frames >= 3 {
+            self.native_aspect_tried = true;
+            crate::aspect::lock(frame, BASE_SIZE.x as u32, BASE_SIZE.y as u32);
+        }
+
+        let size = ctx.content_rect().size();
+        let now = Instant::now();
+        // After a correction, wait until the window system has applied it.
+        if let Some((target, sent_at)) = self.aspect.pending {
+            if (size - target).length() > 1.0 && now.duration_since(sent_at) < Duration::from_secs(1) {
+                ctx.request_repaint_after(SETTLE);
+                return;
+            }
+            self.aspect.pending = None;
+        }
+        if size != self.aspect.last_size {
+            self.aspect.last_size = size;
+            self.aspect.changed_at = now;
+            ctx.request_repaint_after(SETTLE);
             return;
         }
-        self.aspect_frames += 1;
-        if self.aspect_frames == 2 {
-            let size = ui.ctx().content_rect().size();
-            let expected_height = size.x * BASE_SIZE.y / BASE_SIZE.x;
-            if (size.y - expected_height).abs() > 1.0 {
-                ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(size.x, expected_height)));
-            }
+        let ratio = BASE_SIZE.x / BASE_SIZE.y;
+        if (size.x / size.y - ratio).abs() < 0.01 {
+            self.aspect.reference = size;
+            return;
         }
-        if LOCK_FRAMES.contains(&self.aspect_frames)
-            && !crate::aspect::lock(frame, BASE_SIZE.x as u32, BASE_SIZE.y as u32)
-            && self.aspect_frames == 10
-        {
-            eprintln!("could not lock the window aspect ratio");
+        if now.duration_since(self.aspect.changed_at) < SETTLE {
+            ctx.request_repaint_after(SETTLE);
+            return;
         }
+        // The dimension the user changed more (relative to the last good size) wins.
+        let reference = self.aspect.reference;
+        let width_change = (size.x - reference.x).abs() / reference.x.max(1.0);
+        let height_change = (size.y - reference.y).abs() / reference.y.max(1.0);
+        let mut target = if reference == egui::Vec2::ZERO || width_change >= height_change {
+            egui::vec2(size.x, size.x / ratio)
+        } else {
+            egui::vec2(size.y * ratio, size.y)
+        };
+        target = target.max(BASE_SIZE * MIN_SCALE).round();
+        self.aspect.reference = target;
+        self.aspect.pending = Some((target, now));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
     }
 
     fn hotkey_hint(&self, action: Action) -> String {
@@ -382,28 +506,61 @@ impl StopwatchApp {
         }
     }
 
-    fn history_window(&mut self, ctx: &egui::Context) {
+    /// Shows a fixed-size dialog window that stays above the timer window.
+    /// `footer` is drawn in a bar at the bottom, `body` fills the rest.
+    /// Returns true if the window should be closed.
+    fn dialog(&mut self, ctx: &egui::Context, dialog: Dialog) -> bool {
+        let Dialog {
+            id,
+            title,
+            size,
+            frames,
+            body,
+            footer,
+        } = dialog;
         let builder = ViewportBuilder::default()
-            .with_title(format!("{} – {}", self.t(T::AppTitle), self.t(T::History)))
-            .with_inner_size([420.0, 440.0])
-            .with_min_inner_size([340.0, 240.0])
+            .with_title(format!("{} – {}", self.t(T::AppTitle), self.t(title)))
+            .with_inner_size(size)
+            .with_resizable(false)
+            .with_maximize_button(false)
+            // Otherwise it could open behind the always-on-top timer window.
             .with_window_level(WindowLevel::AlwaysOnTop);
 
-        let close =
-            ctx.show_viewport_immediate(ViewportId::from_hash_of("history"), builder, |ui, _class| {
-                if self.history_frames < 10 {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
-                }
-                keep_on_top(ui, &mut self.history_frames);
-                let mut close = ui.input(|i| i.viewport().close_requested());
-                egui::Panel::bottom("history_actions").show(ui, |ui| {
-                    ui.add_space(6.0);
-                    close |= self.history_actions_ui(ui);
-                    ui.add_space(6.0);
+        ctx.show_viewport_immediate(ViewportId::from_hash_of(id), builder, |ui, _class| {
+            let frames = frames(self);
+            if *frames < 10 {
+                // Raise above the (also always-on-top) timer window, once it is mapped.
+                ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
+            }
+            keep_on_top(ui, frames);
+
+            let mut close = ui.input(|i| i.viewport().close_requested());
+            let margin = egui::Margin::symmetric(DIALOG_MARGIN as i8, 12);
+            egui::Panel::bottom(format!("{id}_footer"))
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+                .show(ui, |ui| close |= footer(self, ui));
+            egui::CentralPanel::default_margins()
+                .frame(egui::Frame::central_panel(ui.style()).inner_margin(DIALOG_MARGIN))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    body(self, ui)
                 });
-                egui::CentralPanel::default_margins().show(ui, |ui| self.history_list_ui(ui));
-                close
-            });
+            close
+        })
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        let close = self.dialog(
+            ctx,
+            Dialog {
+                id: "history",
+                title: T::History,
+                size: egui::vec2(460.0, 480.0),
+                frames: |app| &mut app.history_frames,
+                body: Self::history_list_ui,
+                footer: Self::history_footer_ui,
+            },
+        );
         if close {
             self.history_open = false;
             self.confirm_clear = false;
@@ -411,45 +568,71 @@ impl StopwatchApp {
     }
 
     fn history_list_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.t(T::History));
-        ui.add_space(6.0);
         if self.history.entries.is_empty() {
-            ui.label(RichText::new(self.t(T::NoMeasurements)).weak());
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| ui.label(RichText::new(self.t(T::NoMeasurements)).weak()));
             return;
         }
         let date_format = match self.lang() {
-            Lang::De => "%d.%m.%Y  %H:%M:%S",
-            Lang::En => "%Y-%m-%d  %H:%M:%S",
+            Lang::De => "%d.%m.%Y   %H:%M:%S",
+            Lang::En => "%Y-%m-%d   %H:%M:%S",
         };
+
+        // Column widths: number, date/time (takes the rest), duration, delete button.
+        let row_height = 28.0;
+        let gap = ui.spacing().item_spacing.x;
+        let full = ui.available_width();
+        let (number_w, duration_w, delete_w) = (36.0, 110.0, 28.0);
+        let date_w = full - number_w - duration_w - delete_w - 3.0 * gap;
+        let widths = [number_w, date_w, duration_w, delete_w];
+
+        let header = [
+            RichText::new("#"),
+            RichText::new(self.t(T::DateTime)),
+            RichText::new(self.t(T::Duration)),
+            RichText::new(""),
+        ];
+        ui.horizontal(|ui| {
+            for (text, width) in header.into_iter().zip(widths) {
+                cell(ui, width, 20.0, |ui| ui.label(text.strong().weak()));
+            }
+        });
+        ui.separator();
+
         let mut delete = None;
+        let stripe = ui.visuals().faint_bg_color;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("history")
-                    .num_columns(4)
-                    .striped(true)
-                    .spacing([16.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("#").strong());
-                        ui.label(RichText::new(self.t(T::DateTime)).strong());
-                        ui.label(RichText::new(self.t(T::Duration)).strong());
-                        ui.label("");
-                        ui.end_row();
-                        // Newest first.
-                        for (index, entry) in self.history.entries.iter().enumerate().rev() {
-                            ui.label(RichText::new(format!("{}", index + 1)).weak());
-                            ui.label(entry.finished_at.format(date_format).to_string());
-                            ui.label(RichText::new(format_duration(entry.duration())).monospace());
-                            if ui
-                                .small_button("✖")
-                                .on_hover_text(self.t(T::DeleteEntry))
-                                .clicked()
-                            {
-                                delete = Some(index);
-                            }
-                            ui.end_row();
-                        }
+                ui.spacing_mut().item_spacing.y = 2.0;
+                // Newest first.
+                for (row, (index, entry)) in self.history.entries.iter().enumerate().rev().enumerate() {
+                    let fill = if row % 2 == 0 {
+                        stripe
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    egui::Frame::new().fill(fill).corner_radius(4.0).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            cell(ui, widths[0], row_height, |ui| {
+                                ui.label(RichText::new(format!("{}", index + 1)).weak())
+                            });
+                            cell(ui, widths[1], row_height, |ui| {
+                                ui.label(entry.finished_at.format(date_format).to_string())
+                            });
+                            cell(ui, widths[2], row_height, |ui| {
+                                let font = egui::FontId::new(15.0, egui::FontFamily::Name(CLOCK_FONT.into()));
+                                ui.label(RichText::new(format_duration(entry.duration())).font(font))
+                            });
+                            cell(ui, widths[3], row_height, |ui| {
+                                let button = egui::Button::new("✖").frame(false);
+                                if ui.add(button).on_hover_text(self.t(T::DeleteEntry)).clicked() {
+                                    delete = Some(index);
+                                }
+                            });
+                        });
                     });
+                }
             });
         if let Some(index) = delete {
             self.history.entries.remove(index);
@@ -457,23 +640,25 @@ impl StopwatchApp {
         }
     }
 
-    /// Returns true if the window should be closed.
-    fn history_actions_ui(&mut self, ui: &mut egui::Ui) -> bool {
+    fn history_footer_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close = false;
-        if self.confirm_clear {
-            ui.label(RichText::new(self.t(T::ConfirmClear)).color(ui.visuals().warn_fg_color));
-            ui.horizontal(|ui| {
-                if ui.button(self.t(T::ConfirmClearYes)).clicked() {
-                    self.history.entries.clear();
-                    self.save_error |= self.history.save().is_err();
-                    self.confirm_clear = false;
-                }
-                if ui.button(self.t(T::Cancel)).clicked() {
-                    self.confirm_clear = false;
-                }
-            });
-        } else {
-            ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
+            if self.confirm_clear {
+                ui.label(RichText::new(self.t(T::ConfirmClear)).color(ui.visuals().warn_fg_color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.t(T::Cancel)).clicked() {
+                        self.confirm_clear = false;
+                    }
+                    let yes =
+                        egui::Button::new(RichText::new(self.t(T::ConfirmClearYes)).color(Color32::WHITE))
+                            .fill(ui.visuals().error_fg_color);
+                    if ui.add(yes).clicked() {
+                        self.history.entries.clear();
+                        self.save_error |= self.history.save().is_err();
+                        self.confirm_clear = false;
+                    }
+                });
+            } else {
                 let has_entries = !self.history.entries.is_empty();
                 if ui
                     .add_enabled(has_entries, egui::Button::new(self.t(T::ClearAll)))
@@ -484,53 +669,49 @@ impl StopwatchApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     close = ui.button(self.t(T::Close)).clicked();
                 });
-            });
-        }
+            }
+        });
         close
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
-        let builder = ViewportBuilder::default()
-            .with_title(format!("{} – {}", self.t(T::AppTitle), self.t(T::Settings)))
-            .with_inner_size([460.0, 420.0])
-            .with_min_inner_size([380.0, 320.0])
-            // Otherwise it could open behind the always-on-top timer window.
-            .with_window_level(WindowLevel::AlwaysOnTop);
-
-        let close =
-            ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, _class| {
-                if self.settings_frames < 10 {
-                    // Raise above the (also always-on-top) timer window, once it is mapped.
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
-                }
-                keep_on_top(ui, &mut self.settings_frames);
-                let mut close = ui.input(|i| i.viewport().close_requested());
-                egui::CentralPanel::default_margins().show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        close |= self.settings_ui(ui);
-                    });
-                });
-                close
-            });
+        let close = self.dialog(
+            ctx,
+            Dialog {
+                id: "settings",
+                title: T::Settings,
+                size: egui::vec2(500.0, 452.0),
+                frames: |app| &mut app.settings_frames,
+                body: Self::settings_ui,
+                footer: Self::settings_footer_ui,
+            },
+        );
         if close {
             self.close_settings();
         }
     }
 
-    /// Returns true if the window should be closed.
-    fn settings_ui(&mut self, ui: &mut egui::Ui) -> bool {
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         self.capture_hotkey(ui, &mut changed);
+        let label_w = 110.0;
+        let row_h = 28.0;
 
-        ui.heading(self.t(T::Hotkeys));
-        ui.add_space(4.0);
-        egui::Grid::new("hotkeys")
-            .num_columns(3)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                for action in Action::ALL {
-                    ui.label(self.action_label(action));
-                    let text = if self.recording == Some(action) {
+        section(ui, self.t(T::Hotkeys), |ui| {
+            // Same widths in every row, independent of what each row contains.
+            let gap = ui.spacing().item_spacing.x;
+            let row_w = ui.available_width();
+            let clear_w = row_h;
+            let warn_w = 16.0;
+            for action in Action::ALL {
+                ui.horizontal(|ui| {
+                    cell(ui, label_w, row_h, |ui| ui.label(self.action_label(action)));
+                    let failed = self.failed_hotkeys.contains(&action) && self.combo(action).is_some();
+                    let field_w =
+                        row_w - label_w - clear_w - 2.0 * gap - if failed { warn_w + gap } else { 0.0 };
+
+                    let recording = self.recording == Some(action);
+                    let text = if recording {
                         RichText::new(self.t(T::PressKey)).italics()
                     } else {
                         match self.combo(action) {
@@ -538,105 +719,99 @@ impl StopwatchApp {
                             None => RichText::new(self.t(T::NotSet)).weak(),
                         }
                     };
-                    let failed = self.failed_hotkeys.contains(&action) && self.combo(action).is_some();
-                    let button = egui::Button::new(text)
-                        .selected(self.recording == Some(action))
-                        .min_size([220.0, 0.0].into());
-                    let response = ui.add(button).on_hover_text(self.t(T::ClickToChange));
-                    if response.clicked() {
-                        self.recording = if self.recording == Some(action) {
-                            None
-                        } else {
-                            Some(action)
-                        };
+                    let field = egui::Button::new(text).selected(recording);
+                    if ui
+                        .add_sized([field_w, row_h], field)
+                        .on_hover_text(self.t(T::ClickToChange))
+                        .clicked()
+                    {
+                        self.recording = if recording { None } else { Some(action) };
                     }
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.combo(action).is_some(), egui::Button::new("✖"))
-                            .on_hover_text(self.t(T::ClearHotkey))
-                            .clicked()
-                        {
-                            self.config.hotkeys.set(action, None);
-                            self.recording = None;
-                            changed = true;
-                        }
-                        if failed {
-                            ui.label(RichText::new("⚠").color(ui.visuals().warn_fg_color))
-                                .on_hover_text(self.t(T::HotkeyFailed));
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-        ui.add_space(4.0);
-        if ui.button(self.t(T::RestoreDefaults)).clicked() {
-            self.config.hotkeys = Hotkeys::default();
-            self.recording = None;
-            changed = true;
-        }
-        ui.add_space(2.0);
-        ui.label(RichText::new(self.t(T::SharedPauseHint)).small().weak());
-        ui.label(RichText::new(self.t(T::HotkeysSuspended)).small().weak());
-        match self.hotkeys.backend_name() {
-            Some(name) => ui.label(
-                RichText::new(format!("{}: {name}", self.t(T::HotkeyBackend)))
-                    .small()
-                    .weak(),
-            ),
-            None => ui.label(
-                RichText::new(self.t(T::HotkeysUnavailable))
-                    .small()
-                    .color(ui.visuals().warn_fg_color),
-            ),
-        };
-
-        ui.add_space(12.0);
-        ui.heading(self.t(T::Appearance));
-        ui.add_space(4.0);
-        egui::Grid::new("appearance")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                let lang = self.lang();
-                ui.label(self.t(T::Theme));
-                ui.horizontal(|ui| {
-                    for (mode, text) in [
-                        (ThemeMode::System, T::ThemeSystem),
-                        (ThemeMode::Light, T::ThemeLight),
-                        (ThemeMode::Dark, T::ThemeDark),
-                    ] {
-                        changed |= ui
-                            .radio_value(&mut self.config.theme, mode, tr(lang, text))
-                            .changed();
+                    if failed {
+                        ui.label(RichText::new("⚠").color(ui.visuals().warn_fg_color))
+                            .on_hover_text(self.t(T::HotkeyFailed));
+                    }
+                    let clear = ui
+                        .add_enabled_ui(self.combo(action).is_some(), |ui| {
+                            ui.add_sized([clear_w, row_h], egui::Button::new("✖"))
+                        })
+                        .inner
+                        .on_hover_text(self.t(T::ClearHotkey));
+                    if clear.clicked() {
+                        self.config.hotkeys.set(action, None);
+                        self.recording = None;
+                        changed = true;
                     }
                 });
-                ui.end_row();
-
-                ui.label(self.t(T::Language));
-                ui.horizontal(|ui| {
-                    let system = tr(lang, T::LanguageSystem);
-                    for (mode, text) in [
-                        (LanguageMode::System, system),
-                        (LanguageMode::De, "Deutsch"),
-                        (LanguageMode::En, "English"),
-                    ] {
-                        changed |= ui.radio_value(&mut self.config.language, mode, text).changed();
+            }
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let hint = match self.hotkeys.backend_name() {
+                    Some(name) => RichText::new(format!("{}: {name}", self.t(T::HotkeyBackend)))
+                        .small()
+                        .weak(),
+                    None => RichText::new(self.t(T::HotkeysUnavailable))
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                };
+                ui.label(hint);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.t(T::RestoreDefaults)).clicked() {
+                        self.config.hotkeys = Hotkeys::default();
+                        self.recording = None;
+                        changed = true;
                     }
                 });
-                ui.end_row();
             });
+            ui.label(RichText::new(self.t(T::SharedPauseHint)).small().weak());
+            ui.label(RichText::new(self.t(T::HotkeysSuspended)).small().weak());
+        });
+
+        ui.add_space(4.0);
+        let lang = self.lang();
+        section(ui, self.t(T::Appearance), |ui| {
+            let themes = [
+                (ThemeMode::System, tr(lang, T::ThemeSystem)),
+                (ThemeMode::Light, tr(lang, T::ThemeLight)),
+                (ThemeMode::Dark, tr(lang, T::ThemeDark)),
+            ];
+            changed |= select_row(
+                ui,
+                "theme",
+                tr(lang, T::Theme),
+                label_w,
+                &mut self.config.theme,
+                &themes,
+            );
+            let languages = [
+                (LanguageMode::System, tr(lang, T::LanguageSystem)),
+                (LanguageMode::De, "Deutsch"),
+                (LanguageMode::En, "English"),
+            ];
+            changed |= select_row(
+                ui,
+                "language",
+                tr(lang, T::Language),
+                label_w,
+                &mut self.config.language,
+                &languages,
+            );
+        });
 
         if changed {
             self.save();
         }
+    }
 
-        ui.add_space(12.0);
+    fn settings_footer_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close = false;
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            close = ui.button(self.t(T::Close)).clicked();
+        ui.horizontal(|ui| {
             if self.save_error {
-                ui.label(RichText::new(self.t(T::SaveFailed)).color(Color32::RED));
+                ui.label(RichText::new(self.t(T::SaveFailed)).color(ui.visuals().error_fg_color));
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                close = ui.button(self.t(T::Close)).clicked();
+            });
         });
         close
     }
@@ -706,7 +881,11 @@ impl eframe::App for StopwatchApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         keep_on_top(ui, &mut self.root_frames);
-        self.lock_aspect_ratio(ui, frame);
+        self.enforce_aspect_ratio(ui, frame);
+        // Maximizing (e.g. double-click on the title bar) would break the aspect ratio.
+        if ui.input(|i| i.viewport().maximized == Some(true)) {
+            ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(false));
+        }
 
         let scale = (ui.ctx().content_rect().width() / BASE_SIZE.x).max(MIN_SCALE);
         let panel = egui::Frame::central_panel(ui.style()).inner_margin(8.0 * scale);

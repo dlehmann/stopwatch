@@ -9,7 +9,7 @@ and Windows as a single self-contained binary.
 ## Features
 
 - Always-on-top timer window (`HH:MM:SS.cc` in Fira Code)
-- The whole window content scales when the window is resized; the aspect ratio is locked
+- The whole window content scales when the window is resized; the aspect ratio is kept
 - Actions **Start / Stop**, **Pause**, **Resume** and **Reset**, as buttons and as global hotkeys
 - **Recent measurements** window: every finished measurement is saved with date and time;
   single entries or all entries can be deleted
@@ -32,6 +32,8 @@ sudo pacman -U stopwatch-X.Y.Z-1-x86_64.pkg.tar.zst
 ```
 
 ### Debian / Ubuntu
+
+Requires Debian 12, Ubuntu 22.04 or newer.
 
 ```bash
 sudo apt install ./stopwatch_X.Y.Z-1_amd64.deb
@@ -110,9 +112,9 @@ While the settings window is open, the global hotkeys are disabled.
 |--------------------------|---------------------------------------------|---------------|---------------------|
 | Windows                  | `RegisterHotKey`                            | yes           | yes                 |
 | macOS                    | Carbon hot keys (no permission prompt)      | yes           | yes                 |
-| Linux, KDE Plasma        | KGlobalAccel via D-Bus (X11 and Wayland)    | yes           | yes                 |
-| Linux, other X11 desktop | X11 key grabs                               | yes           | yes                 |
-| Linux, GNOME on Wayland  | only while an X11/XWayland window has focus | yes           | yes                 |
+| Linux, KDE Plasma        | KGlobalAccel via D-Bus (X11 and Wayland)    | yes           | snaps after resize  |
+| Linux, other X11 desktop | X11 key grabs                               | yes           | snaps after resize  |
+| Linux, GNOME on Wayland  | only while an X11/XWayland window has focus | yes           | snaps after resize  |
 
 On Linux the window always uses X11 (XWayland on Wayland sessions), because Wayland
 does not let applications keep their window on top. The "follow system" color scheme

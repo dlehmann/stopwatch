@@ -10,6 +10,7 @@ license=('MIT')
 # Loaded at runtime via dlopen (X11 and OpenGL).
 depends=('glibc' 'gcc-libs' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon-x11' 'libglvnd')
 source=("stopwatch" "stopwatch.desktop" "stopwatch.png" "LICENSE")
+options=('!debug')
 sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 package() {
